@@ -60,6 +60,10 @@ This repository implements a solution that uses an optimizer to find the best GN
     ```
 The predicted delays will be saved in the specified output directory. The output CSV files from the prediction include the runtime in CSV and JSON formats, as well as a file comparing the actual target with the target predicted by the model.
 
+## IEEE Dataport Dataset
+This section provides access to a specialized dataset containing historical traceroute information and delay measurements collected from RNP (Brazilian National Research and Education Network). The data collected for the experiment is from 2023:
+https://ieee-dataport.org/documents/datasets-delay-traceroute-2023
+
 ## Contact
 
 For any questions or suggestions:
