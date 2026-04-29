@@ -92,7 +92,12 @@ class HyperparameterOptimizer:
         return logger
 
     def suggest_hyperparameters(self, trial: Trial) -> Dict[str, Any]:
-        window_size = trial.suggest_categorical("window_size", [4, 6, 8, 10, 12])
+        use_prebuilt_dataset = getattr(self.base_args, "dataset_joblib", None) is not None
+        
+        if not use_prebuilt_dataset:
+            window_size = trial.suggest_categorical("window_size", [4, 6, 8, 10, 12])
+        else:
+            window_size = self.base_args.window_size
 
         hidden_channels = trial.suggest_categorical(
             "hidden_channels", [32, 64, 128, 256]
@@ -100,7 +105,9 @@ class HyperparameterOptimizer:
 
         num_layers = trial.suggest_int("num_layers", 2, 4)
 
-        conv_type = trial.suggest_categorical("conv_type", ["gat", "sage"])
+        conv_type = trial.suggest_categorical(
+            "conv_type", ["sage", "tgcn", "gat"]
+        )
 
         dropout = trial.suggest_float("dropout", 0.1, 0.5, step=0.1)
 
@@ -112,31 +119,11 @@ class HyperparameterOptimizer:
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
         batch_size = trial.suggest_categorical("batch_size", [8, 16, 32, 64])
 
-        loss_fn = trial.suggest_categorical("loss_fn", ["cross_entropy", "focal"])
+        label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.2, step=0.05)
 
-        focal_alpha = 0.25
-        focal_gamma = 2.0
-        if loss_fn == "focal":
-            focal_alpha = trial.suggest_float("focal_alpha", 0.6, 0.9, step=0.05)
-            focal_gamma = trial.suggest_float("focal_gamma", 1.5, 4.0, step=0.5)
+        sample_weight_alpha = trial.suggest_float("sample_weight_alpha", 1.0, 5.0, step=0.5)
 
-        balance_mode = trial.suggest_categorical(
-            "balance_mode", ["class", "sampler", "both"]
-        )
-
-        use_percentile = trial.suggest_categorical("use_percentile", [True, False])
-
-        delay_threshold = None
-        delay_percentile = 85.0
-
-        if use_percentile:
-            delay_percentile = trial.suggest_categorical(
-                "delay_percentile", [75.0, 80.0, 85.0]
-            )
-        else:
-            delay_threshold = trial.suggest_float(
-                "delay_threshold", 50.0, 200.0, step=10.0
-            )
+        max_grad_norm = trial.suggest_categorical("max_grad_norm", [0.5, 1.0, 2.0, 5.0])
 
         scheduler = trial.suggest_categorical(
             "scheduler", ["none", "plateau", "cosine"]
@@ -154,15 +141,7 @@ class HyperparameterOptimizer:
         elif scheduler == "cosine":
             scheduler_t0 = trial.suggest_int("scheduler_t0", 5, 15)
 
-        use_undersample = trial.suggest_categorical("use_undersample", [True, False])
-        undersample_ratio = None
-        if use_undersample:
-            undersample_ratio = trial.suggest_float(
-                "undersample_ratio", 2.0, 8.0, step=1.0
-            )
-
-        return {
-            "window_size": window_size,
+        params = {
             "hidden_channels": hidden_channels,
             "num_layers": num_layers,
             "conv_type": conv_type,
@@ -171,18 +150,19 @@ class HyperparameterOptimizer:
             "lr": lr,
             "weight_decay": weight_decay,
             "batch_size": batch_size,
-            "loss_fn": loss_fn,
-            "focal_alpha": focal_alpha,
-            "focal_gamma": focal_gamma,
-            "balance_mode": balance_mode,
-            "delay_threshold": delay_threshold,
-            "delay_percentile": delay_percentile,
+            "label_smoothing": label_smoothing,
+            "sample_weight_alpha": sample_weight_alpha,
+            "max_grad_norm": max_grad_norm,
             "scheduler": scheduler,
             "scheduler_factor": scheduler_factor,
             "scheduler_patience": scheduler_patience,
             "scheduler_t0": scheduler_t0,
-            "undersample_ratio": undersample_ratio,
         }
+        
+        if not use_prebuilt_dataset:
+            params["window_size"] = window_size
+        
+        return params
 
     def objective(self, trial: Trial) -> float:
         suggested_params = self.suggest_hyperparameters(trial)
@@ -462,8 +442,6 @@ def main():
         horizon_minutes=args.horizon_minutes,
         min_corr=args.min_corr,
         limit_samples=args.limit_samples,
-        use_traceroute=True,
-        topology_weight=0.4,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         epochs=args.epochs,
@@ -477,17 +455,13 @@ def main():
         lr=1e-3,
         weight_decay=1e-4,
         batch_size=16,
-        loss_fn="cross_entropy",
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        balance_mode="class",
-        delay_threshold=None,
-        delay_percentile=85.0,
+        label_smoothing=0.1,
+        sample_weight_alpha=2.0,
+        max_grad_norm=1.0,
         scheduler="none",
         scheduler_factor=0.5,
         scheduler_patience=5,
         scheduler_t0=10,
-        undersample_ratio=None,
         patience=0,
         model_path=args.output_dir / "temp_model.pt",
     )
