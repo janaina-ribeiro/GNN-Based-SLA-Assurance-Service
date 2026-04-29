@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import argparse
+import joblib
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from torch_geometric.data import Data
 
 
@@ -16,6 +18,51 @@ class GraphSplit:
     train: torch.utils.data.Dataset
     val: torch.utils.data.Dataset
     test: torch.utils.data.Dataset
+
+
+def temporal_split(
+    dataset: "DelayGraphDataset",
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+) -> GraphSplit:
+    """
+    Temporal train/val/test split based on sample timestamps.
+    -----------------------------------------------------------
+    The dataset is ordered by its internal timestamp vector and then split
+    sequentially according to the provided ratios, mirroring the strategy
+    used for the GNN experiments so it can be reused for other models.
+    """
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError("train_ratio must be in (0, 1)")
+    if val_ratio < 0.0 or train_ratio + val_ratio >= 1.0:
+        raise ValueError("val_ratio must be >= 0 and train_ratio + val_ratio < 1")
+
+    n_samples = len(dataset)
+    if n_samples == 0:
+        raise ValueError("Cannot split empty dataset")
+
+    timestamps = np.array(dataset.sample_timestamps)
+    order = np.argsort(timestamps)
+
+    n_train = int(n_samples * train_ratio)
+    n_val = int(n_samples * val_ratio)
+    n_test = n_samples - n_train - n_val
+
+    if n_train == 0 or n_val == 0 or n_test <= 0:
+        raise ValueError(
+            f"Split ratios too aggressive for {n_samples} samples: "
+            f"train={train_ratio}, val={val_ratio}."
+        )
+
+    train_idx = order[:n_train]
+    val_idx = order[n_train : n_train + n_val]
+    test_idx = order[n_train + n_val :]
+
+    return GraphSplit(
+        train=Subset(dataset, train_idx.tolist()),
+        val=Subset(dataset, val_idx.tolist()),
+        test=Subset(dataset, test_idx.tolist()),
+    )
 
 
 def _infer_step_minutes(timestamps: pd.Series) -> float:
@@ -138,10 +185,10 @@ def _resample_frame(
 
     agg = frame[numeric_cols].resample(rule).mean()
 
-    agg["Atraso(ms)"] = agg["Atraso(ms)"].interpolate(
+    agg["Atraso"] = agg["Atraso"].interpolate(
         method="linear", limit_direction="both"
     )
-    agg["Atraso(ms)"] = agg["Atraso(ms)"].ffill().bfill()
+    agg["Atraso"] = agg["Atraso"].ffill().bfill()
 
     if "Num_Hops" in agg.columns:
         agg["Num_Hops"] = agg["Num_Hops"].interpolate(
@@ -150,8 +197,8 @@ def _resample_frame(
         agg["Num_Hops"] = agg["Num_Hops"].ffill().bfill()
 
     if delay_threshold is not None:
-        agg["high_delay"] = (agg["Atraso(ms)"] > delay_threshold).astype(int)
-    agg = agg.dropna(subset=["Atraso(ms)"], how="all")
+        agg["high_delay"] = (agg["Atraso"] > delay_threshold).astype(int)
+    agg = agg.dropna(subset=["Atraso"], how="all")
     agg = agg.reset_index()
     return agg
 
@@ -322,7 +369,7 @@ class DelayGraphDataset(Dataset):
         delay_threshold: Optional[float] = None,
         delay_percentile: float = 85.0,
         topology_weight: float = 0.4,
-        column_delay: str = "Atraso(ms)",
+        column_delay: str = "Atraso",
     ) -> None:
         if window_size < 2:
             raise ValueError("window_size must be >= 2")
@@ -408,6 +455,71 @@ class DelayGraphDataset(Dataset):
         self._window_size = window_size
         self._offset_steps = offset_steps
 
+
+    def _to_serializable(self) -> Dict[str, object]:
+        """Convert internal tensors and metadata to a joblib-friendly dict."""
+        return {
+            "features": self.features.cpu().numpy(),
+            "labels": self.labels.cpu().numpy(),
+            "edge_index": self.edge_index.cpu().numpy(),
+            "edge_weight": self.edge_weight.cpu().numpy(),
+            "sample_timestamps": [ts.isoformat() for ts in self.sample_timestamps],
+            "links": list(self.links),
+            "delay_threshold": float(self.delay_threshold),
+            "delay_percentile": float(self.delay_percentile),
+            "topology_weight": float(self.topology_weight),
+            "column_delay": str(self.column_delay),
+            "freq_minutes": int(self._freq_minutes),
+            "window_size": int(self._window_size),
+            "offset_steps": int(self._offset_steps),
+        }
+
+    @classmethod
+    def _from_serializable(cls, payload: Dict[str, object]) -> "DelayGraphDataset":
+        """Rebuild a DelayGraphDataset-like instance from a serialized dict.
+
+        This bypasses the __init__ that reads CSVs and instead restores tensors
+        and metadata directly, so it can be used for training without
+        reprocessing the raw data.
+        """
+        obj = cls.__new__(cls)   
+        Dataset.__init__(obj)
+
+        obj.features = torch.from_numpy(payload["features"]).float() 
+        obj.labels = torch.from_numpy(payload["labels"]).long()  
+        obj.edge_index = torch.from_numpy(payload["edge_index"]).long()  
+        obj.edge_weight = torch.from_numpy(payload["edge_weight"]).float()  
+
+        obj.sample_timestamps = [
+            pd.Timestamp(ts) for ts in payload["sample_timestamps"]  
+
+        ]
+        obj.links = list(payload["links"])  
+
+        obj.delay_threshold = float(payload["delay_threshold"])  
+        obj.delay_percentile = float(payload["delay_percentile"])  
+        obj.topology_weight = float(payload.get("topology_weight", 0.4))  
+        obj.column_delay = str(payload.get("column_delay", "Atraso"))  
+
+        obj._freq_minutes = int(payload.get("freq_minutes", 5))  
+        obj._window_size = int(payload.get("window_size", 3))  
+        obj._offset_steps = int(payload.get("offset_steps", 1))  
+
+        obj._combined_frame = None
+        return obj
+
+    def save_joblib(self, output_path: Path | str) -> None:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self._to_serializable(), path)
+
+    @classmethod
+    def load_joblib(cls, input_path: Path | str) -> "DelayGraphDataset":
+        payload = joblib.load(Path(input_path))
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid joblib payload: expected a dict")
+        return cls._from_serializable(payload)
+
     def _discover_links(self, links: Optional[Sequence[str]]) -> List[str]:
         if links:
             return list(links)
@@ -433,7 +545,6 @@ class DelayGraphDataset(Dataset):
             if self.column_delay not in df.columns:
                 raise ValueError(f"Column '{self.column_delay}' not found in {file_path}")
 
-            # Traceroute features são obrigatórias
             if "Num_Hops" not in df.columns and "Total_Hops" not in df.columns:
                 raise ValueError(f"Column 'Num_Hops' or 'Total_Hops' not found in {file_path}, traceroute features are mandatory.")
             if "Total_Hops" in df.columns and "Num_Hops" not in df.columns:
@@ -518,7 +629,7 @@ class DelayGraphDataset(Dataset):
             ren = ren.set_index("Timestamp")
             delay_frames.append(ren)
 
-            if self.use_traceroute and "Num_Hops" in frame.columns:
+            if "Num_Hops" in frame.columns:
                 hops_frame = frame[["Timestamp", "Num_Hops"]].copy()
                 hops_ren = hops_frame.rename(columns={"Num_Hops": f"hops_{link}"})
                 hops_ren = hops_ren.set_index("Timestamp")
@@ -718,7 +829,7 @@ class DelayGraphDataset(Dataset):
 
 
 def _resample_frame(
-    df: pd.DataFrame, freq_minutes: int, delay_threshold: Optional[float] = None, column_delay: str = "Atraso(ms)"
+    df: pd.DataFrame, freq_minutes: int, delay_threshold: Optional[float] = None, column_delay: str = "Atraso"
 ) -> pd.DataFrame:
     """
     Resamples the dataframe to a uniform frequency.
@@ -758,3 +869,91 @@ def _resample_frame(
     agg = agg.dropna(subset=[column_delay], how="all")
     agg = agg.reset_index()
     return agg
+
+
+def parse_args() -> "argparse.Namespace":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build DelayGraphDataset for GNN")
+    parser.add_argument("--data-dir", type=Path, default=Path("datasets_generated"))
+    parser.add_argument("--links", nargs="*", default=None)
+    parser.add_argument("--window-size", type=int, default=12)
+    parser.add_argument("--horizon-minutes", type=int, default=60)
+    parser.add_argument("--min-corr", type=float, default=0.3)
+    parser.add_argument("--limit-samples", type=int, default=None)
+    parser.add_argument("--delay-threshold", type=float, default=None)
+    parser.add_argument("--delay-percentile", type=float, default=85.0)
+    parser.add_argument("--topology-weight", type=float, default=0.4)
+    parser.add_argument("--column-delay", type=str, default="Atraso")
+    parser.add_argument(
+        "--output-joblib",
+        type=Path,
+        default=Path("results_artifacts/gnn_dataset.joblib"),
+        help="Path to save the pre-built dataset (.joblib)",
+    )
+    parser.add_argument(
+        "--generate-all-horizons",
+        action="store_true",
+        help="Generate datasets for all horizons (1, 3, 5, 10, 30 min)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results_artifacts/datasets"),
+        help="Output directory when generating multiple horizons",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.generate_all_horizons:
+        horizons = [1, 3, 5, 10, 30]
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        print("=" * 60)
+        print(f"Generating GNN datasets for {len(horizons)} horizons")
+        print("=" * 60)
+        
+        for horizon in horizons:
+            print(f"\n[{horizon}min] Building dataset...")
+            dataset = DelayGraphDataset(
+                data_dir=args.data_dir,
+                links=args.links,
+                window_size=args.window_size,
+                horizon_minutes=horizon,
+                min_corr=args.min_corr,
+                limit_samples=args.limit_samples,
+                delay_threshold=args.delay_threshold,
+                delay_percentile=args.delay_percentile,
+                topology_weight=args.topology_weight,
+                column_delay=args.column_delay,
+            )
+            print(f"[{horizon}min] Built: {len(dataset)} samples, {dataset.num_node_features} features")
+            
+            output_path = args.output_dir / f"gnn_dataset_w{args.window_size}_h{horizon}min.joblib"
+            dataset.save_joblib(output_path)
+            print(f"[{horizon}min] Saved to {output_path}")
+        
+        print("\n" + "=" * 60)
+        print("All GNN datasets generated successfully!")
+        print(f"Location: {args.output_dir}")
+        print("=" * 60)
+    else:
+        dataset = DelayGraphDataset(
+            data_dir=args.data_dir,
+            links=args.links,
+            window_size=args.window_size,
+            horizon_minutes=args.horizon_minutes,
+            min_corr=args.min_corr,
+            limit_samples=args.limit_samples,
+            delay_threshold=args.delay_threshold,
+            delay_percentile=args.delay_percentile,
+            topology_weight=args.topology_weight,
+            column_delay=args.column_delay,
+        )
+
+        print(f"[INFO] Built DelayGraphDataset with {len(dataset)} samples and {dataset.num_nodes} nodes")
+        dataset.save_joblib(args.output_joblib)
+        print(f"[INFO] Saved pre-built dataset to {args.output_joblib}")
