@@ -42,10 +42,10 @@ def run_full_optimization(dataset_joblib: Path = None) -> None:
     print("=" * 60)
     
     if dataset_joblib is not None:
-        print(f"⚡ Using pre-built dataset: {dataset_joblib}")
+        print(f" Using pre-built dataset: {dataset_joblib}")
         print("This will SKIP dataset construction and use cached data.")
     else:
-        print("⚠️  No dataset cache provided. Will construct dataset from scratch (SLOW).")
+        print(" No dataset cache provided. Will construct dataset from scratch (SLOW).")
         print("Consider building a dataset first: python -m test_gnn.build_dataset_lstm")
     
     print("This optimization may take several hours.")
@@ -123,7 +123,6 @@ def run_full_optimization(dataset_joblib: Path = None) -> None:
         print("=" * 60)
         print(f"Best model: {best_model_path}")
         
-        # Verifica e informa sobre o arquivo de histórico
         history_json_path = best_model_path.with_name(best_model_path.stem + "_history.json")
         if history_json_path.exists():
             print(f"Training history: {history_json_path}")
@@ -143,7 +142,6 @@ def run_full_optimization(dataset_joblib: Path = None) -> None:
                 best_model_path = optimizer.train_best_model()
                 print(f"Best model saved at: {best_model_path}")
                 
-                # Verifica e informa sobre o arquivo de histórico
                 history_json_path = best_model_path.with_name(best_model_path.stem + "_history.json")
                 if history_json_path.exists():
                     print(f"Training history: {history_json_path}")
