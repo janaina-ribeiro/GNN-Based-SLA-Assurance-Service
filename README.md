@@ -128,7 +128,5 @@ Generated outputs:
 - The loader supports legacy joblib datasets with missing `horizon_minutes` by inferring from `freq_minutes * offset_steps`.
 
 ## Contact
-
-- Janaina Ribeiro
 - janainaribeiro780@gmail.com
 - janaina.ribeiro@aluno.uece.br
