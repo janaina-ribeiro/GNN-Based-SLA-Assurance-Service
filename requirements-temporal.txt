@@ -1,0 +1,2 @@
+torch-geometric-temporal>=0.56.0,<0.58
+networkx>=3.3,<4.0

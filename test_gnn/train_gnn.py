@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -10,12 +12,86 @@ import torch
 import joblib
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, brier_score_loss, f1_score, precision_recall_fscore_support
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from .dataset_builder import DelayGraphDataset, temporal_split
 from .gnn_model import DelayGNN
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_dataset_manifest(joblib_path: Path, strict: bool = True) -> None:
+    manifest_path = joblib_path.with_suffix(".manifest.json")
+    if not manifest_path.exists():
+        message = f"Dataset manifest not found: {manifest_path}"
+        if strict:
+            raise ValueError(message)
+        print(f"[WARN] {message}")
+        return
+
+    with manifest_path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    expected = (
+        manifest.get("artifact", {}).get("joblib_sha256")
+        if isinstance(manifest, dict)
+        else None
+    )
+    if not expected:
+        message = f"Manifest {manifest_path} does not contain artifact.joblib_sha256"
+        if strict:
+            raise ValueError(message)
+        print(f"[WARN] {message}")
+        return
+
+    actual = _sha256_file(joblib_path)
+    if actual != expected:
+        raise ValueError(
+            f"Dataset checksum mismatch for {joblib_path}. expected={expected} actual={actual}"
+        )
+
+
+def _validate_dataset_compatibility(
+    dataset: DelayGraphDataset,
+    args: argparse.Namespace,
+    strict: bool = True,
+) -> None:
+    mismatches = []
+
+    dataset_window = int(getattr(dataset, "_window_size", -1))
+    if dataset_window > 0 and int(args.window_size) != dataset_window:
+        mismatches.append(
+            f"window_size: cli={args.window_size} dataset={dataset_window}"
+        )
+
+    dataset_horizon = int(getattr(dataset, "horizon_minutes", -1))
+    if dataset_horizon > 0 and int(args.horizon_minutes) != dataset_horizon:
+        mismatches.append(
+            f"horizon_minutes: cli={args.horizon_minutes} dataset={dataset_horizon}"
+        )
+
+    if args.links:
+        cli_links = list(args.links)
+        ds_links = list(dataset.link_order)
+        if cli_links != ds_links:
+            mismatches.append(
+                "links order/content mismatch between CLI and dataset artifact"
+            )
+
+    if mismatches:
+        details = "; ".join(mismatches)
+        if strict:
+            raise ValueError(f"Incompatible dataset-joblib and CLI args: {details}")
+        print(f"[WARN] Incompatible dataset-joblib and CLI args: {details}")
 
 
 def set_seed(seed: int) -> None:
@@ -75,6 +151,13 @@ def _run_epoch(
     with torch.set_grad_enabled(train_mode):
         for batch in loader:
             batch = _to_device(batch, device)
+
+            # Each batch here is an independent sample group, not a continuous
+            # temporal stream. Reset recurrent hidden state to avoid carrying
+            # incompatible node counts across batches.
+            if getattr(model, "is_temporal", False):
+                model.reset_hidden_state()
+
             logits = model(batch.x, batch.edge_index, getattr(batch, "edge_weight", None))
             loss = criterion(logits, batch.y)
             if train_mode:
@@ -128,12 +211,76 @@ def _compute_sample_weights(dataset: DelayGraphDataset, split_indices, alpha: fl
     return sample_weights
 
 
+class FocalLoss(nn.Module):
+    """Focal loss for classification with optional class weights and label smoothing."""
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        class_weights: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.gamma = float(gamma)
+        self.class_weights = class_weights
+        self.label_smoothing = float(label_smoothing)
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+        num_classes = logits.size(-1)
+
+        if self.label_smoothing > 0.0:
+            smooth = self.label_smoothing / max(num_classes - 1, 1)
+            target_dist = torch.full_like(log_probs, smooth)
+            target_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+            nll = -(target_dist * log_probs).sum(dim=-1)
+            pt = (target_dist * probs).sum(dim=-1)
+            if self.class_weights is not None:
+                weight_factor = (target_dist * self.class_weights.unsqueeze(0)).sum(dim=-1)
+            else:
+                weight_factor = torch.ones_like(nll)
+        else:
+            nll = F.nll_loss(log_probs, targets, reduction="none")
+            pt = probs.gather(dim=1, index=targets.unsqueeze(1)).squeeze(1)
+            if self.class_weights is not None:
+                weight_factor = self.class_weights.gather(0, targets)
+            else:
+                weight_factor = torch.ones_like(nll)
+
+        focal_factor = (1.0 - pt).pow(self.gamma)
+        loss = weight_factor * focal_factor * nll
+
+        if self.reduction == "sum":
+            return loss.sum()
+        if self.reduction == "none":
+            return loss
+        return loss.mean()
+
+
+def _build_criterion(args: argparse.Namespace, class_weights: torch.Tensor) -> nn.Module:
+    label_smoothing = getattr(args, "label_smoothing", 0.0)
+    loss_type = getattr(args, "loss_type", "cross_entropy")
+    if loss_type == "focal":
+        return FocalLoss(
+            gamma=getattr(args, "focal_gamma", 2.0),
+            class_weights=class_weights,
+            label_smoothing=label_smoothing,
+        )
+    return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+
+
 def train_model(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     set_seed(args.seed)
 
     if getattr(args, "dataset_joblib", None) is not None and args.dataset_joblib is not None:
+        strict_dataset = bool(getattr(args, "strict_dataset", False))
+        _validate_dataset_manifest(args.dataset_joblib, strict=strict_dataset)
         dataset = DelayGraphDataset.load_joblib(args.dataset_joblib)
+        _validate_dataset_compatibility(dataset, args, strict=strict_dataset)
         print(f"[INFO] Loaded pre-built dataset from {args.dataset_joblib}")
     else:
         dataset = DelayGraphDataset(
@@ -173,8 +320,7 @@ def train_model(args: argparse.Namespace) -> None:
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    label_smoothing = getattr(args, "label_smoothing", 0.0)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+    criterion = _build_criterion(args, class_weights)
     
     scheduler = None
     scheduler_type = getattr(args, "scheduler", "none")
@@ -184,7 +330,6 @@ def train_model(args: argparse.Namespace) -> None:
             mode="max",
             factor=getattr(args, "scheduler_factor", 0.5),
             patience=getattr(args, "scheduler_patience", 5),
-            verbose=True,
         )
     elif scheduler_type == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -192,7 +337,6 @@ def train_model(args: argparse.Namespace) -> None:
             T_0=getattr(args, "scheduler_t0", 10),
             T_mult=1,
             eta_min=args.lr * 0.01,
-            verbose=True,
         )
     
     max_grad_norm = getattr(args, "max_grad_norm", 1.0)
@@ -279,6 +423,7 @@ def train_model(args: argparse.Namespace) -> None:
             "test_metrics": test_metrics,
         },
     }
+    args.model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(artifact, args.model_path)
     print(f"Model saved to {args.model_path}")
 
@@ -286,11 +431,72 @@ def train_model(args: argparse.Namespace) -> None:
     joblib.dump(artifact, joblib_path)
     print(f"Joblib model saved to {joblib_path}")
 
+    if args.training_log_path is not None:
+        training_log_path = Path(args.training_log_path)
+    else:
+        training_log_path = args.model_path.with_name(args.model_path.stem + "_training_log.json")
+
+    training_log_path.parent.mkdir(parents=True, exist_ok=True)
+    training_log = {
+        "generated_at": datetime.now().isoformat(),
+        "config": {
+            "data_dir": str(args.data_dir),
+            "links": args.links,
+            "window_size": args.window_size,
+            "horizon_minutes": args.horizon_minutes,
+            "min_corr": args.min_corr,
+            "limit_samples": args.limit_samples,
+            "dataset_joblib": str(args.dataset_joblib) if args.dataset_joblib is not None else None,
+            "strict_dataset": bool(getattr(args, "strict_dataset", False)),
+            "train_ratio": args.train_ratio,
+            "val_ratio": args.val_ratio,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "hidden_channels": args.hidden_channels,
+            "num_layers": args.num_layers,
+            "conv_type": args.conv_type,
+            "gat_heads": args.gat_heads,
+            "dropout": args.dropout,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "label_smoothing": args.label_smoothing,
+            "loss_type": args.loss_type,
+            "focal_gamma": args.focal_gamma,
+            "sample_weight_alpha": args.sample_weight_alpha,
+            "max_grad_norm": args.max_grad_norm,
+            "scheduler": args.scheduler,
+            "scheduler_factor": args.scheduler_factor,
+            "scheduler_patience": args.scheduler_patience,
+            "scheduler_t0": args.scheduler_t0,
+            "patience": args.patience,
+            "device": args.device,
+            "seed": args.seed,
+            "model_path": str(args.model_path),
+        },
+        "summary": {
+            "best_val_f1": best_metric,
+            "best_epoch": best_epoch,
+            "total_epochs": len(training_history),
+            "early_stopped": len(training_history) < args.epochs,
+        },
+        "test_metrics": test_metrics,
+        "training_history": training_history,
+    }
+
+    with training_log_path.open("w", encoding="utf-8") as f:
+        json.dump(training_log, f, indent=2)
+    print(f"Training log saved to {training_log_path}")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a GNN to classify link delay levels")
     parser.add_argument("--data-dir", type=Path, default=Path("datasets_generated"))
-    parser.add_argument("--links", nargs="*", default=["ac-am", "ac-ap", "ac-ba", "ac-ce"])
+    parser.add_argument(
+        "--links",
+        nargs="*",
+        default=None,
+        help="Subset of links to use. Leave empty to use all links from dataset/data-dir.",
+    )
     parser.add_argument("--window-size", type=int, default=12)
     parser.add_argument("--horizon-minutes", type=int, default=60)
     parser.add_argument("--min-corr", type=float, default=0.3)
@@ -300,6 +506,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional path to a pre-built DelayGraphDataset (.joblib). If set, data-dir and CSVs are ignored.",
+    )
+    parser.add_argument(
+        "--strict-dataset",
+        action="store_true",
+        help="Fail-fast if manifest is missing/checksum mismatch or CLI args are incompatible with dataset-joblib metadata.",
     )
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--val-ratio", type=float, default=0.15)
@@ -312,8 +523,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="cross_entropy",
+        choices=["cross_entropy", "focal"],
+        help="Loss function used for training.",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=2.0,
+        help="Gamma parameter for focal loss (used only when --loss-type focal).",
+    )
+    parser.add_argument("--sample-weight-alpha", type=float, default=2.0)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="none",
+        choices=["none", "plateau", "cosine"],
+        help="Learning rate scheduler type.",
+    )
+    parser.add_argument("--scheduler-factor", type=float, default=0.5)
+    parser.add_argument("--scheduler-patience", type=int, default=5)
+    parser.add_argument("--scheduler-t0", type=int, default=10)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=0,
+        help="Early stopping patience in epochs (0 disables early stopping).",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--model-path", type=Path, default=Path("test_gnn_delay_model.pt"))
+    parser.add_argument(
+        "--training-log-path",
+        type=Path,
+        default=None,
+        help="Optional path to save training log JSON. Default: <model-path>_training_log.json",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

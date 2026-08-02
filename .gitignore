@@ -1,0 +1,18 @@
+__pycache__
+.venv312
+venv
+test_gnn\optimization_results
+test_gnn\optimized_models\dynamic
+test_gnn\test_results\temp_models
+test_gnn\test_results\fixed_temporal_20260728_094527
+test_gnn\test_results\optimization_logs
+test_gnn\test_results\optimization_results
+
+datasets delay
+datasets traceroute
+
+results_artifacts\base_datasets
+datasets_generated
+results_artifacts\base_datasets
+
+results_artifacts/datasets_graph_sage/*.joblib

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -186,15 +189,15 @@ def _resample_frame(
     agg = frame[numeric_cols].resample(rule).mean()
 
     agg["Atraso"] = agg["Atraso"].interpolate(
-        method="linear", limit_direction="both"
+        method="linear", limit_direction="forward"
     )
-    agg["Atraso"] = agg["Atraso"].ffill().bfill()
+    agg["Atraso"] = agg["Atraso"].ffill()
 
     if "Num_Hops" in agg.columns:
         agg["Num_Hops"] = agg["Num_Hops"].interpolate(
-            method="linear", limit_direction="both"
+            method="linear", limit_direction="forward"
         )
-        agg["Num_Hops"] = agg["Num_Hops"].ffill().bfill()
+        agg["Num_Hops"] = agg["Num_Hops"].ffill()
 
     if delay_threshold is not None:
         agg["high_delay"] = (agg["Atraso"] > delay_threshold).astype(int)
@@ -454,11 +457,14 @@ class DelayGraphDataset(Dataset):
         self._freq_minutes = freq_minutes
         self._window_size = window_size
         self._offset_steps = offset_steps
+        self._horizon_minutes = horizon_minutes
 
 
     def _to_serializable(self) -> Dict[str, object]:
         """Convert internal tensors and metadata to a joblib-friendly dict."""
         return {
+            "schema_version": 2,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "features": self.features.cpu().numpy(),
             "labels": self.labels.cpu().numpy(),
             "edge_index": self.edge_index.cpu().numpy(),
@@ -472,6 +478,7 @@ class DelayGraphDataset(Dataset):
             "freq_minutes": int(self._freq_minutes),
             "window_size": int(self._window_size),
             "offset_steps": int(self._offset_steps),
+            "horizon_minutes": int(self._horizon_minutes),
         }
 
     @classmethod
@@ -501,12 +508,23 @@ class DelayGraphDataset(Dataset):
         obj.topology_weight = float(payload.get("topology_weight", 0.4))  
         obj.column_delay = str(payload.get("column_delay", "Atraso"))  
 
-        obj._freq_minutes = int(payload.get("freq_minutes", 5))  
-        obj._window_size = int(payload.get("window_size", 3))  
-        obj._offset_steps = int(payload.get("offset_steps", 1))  
+        obj._freq_minutes = int(payload.get("freq_minutes", 5))
+        obj._window_size = int(payload.get("window_size", 3))
+        obj._offset_steps = int(payload.get("offset_steps", 1))
+
+        raw_horizon = payload.get("horizon_minutes", None)
+        if raw_horizon is None:
+            inferred_horizon = max(obj._freq_minutes * obj._offset_steps, 1)
+            obj._horizon_minutes = int(inferred_horizon)
+        else:
+            obj._horizon_minutes = int(raw_horizon)
 
         obj._combined_frame = None
         return obj
+
+    @property
+    def horizon_minutes(self) -> int:
+        return int(self._horizon_minutes)
 
     def save_joblib(self, output_path: Path | str) -> None:
         path = Path(output_path)
@@ -519,6 +537,61 @@ class DelayGraphDataset(Dataset):
         if not isinstance(payload, dict):
             raise ValueError("Invalid joblib payload: expected a dict")
         return cls._from_serializable(payload)
+
+    def write_manifest(
+        self,
+        joblib_path: Path | str,
+        input_checksums: Optional[Dict[str, str]] = None,
+    ) -> Path:
+        path = Path(joblib_path)
+        manifest_path = path.with_suffix(".manifest.json")
+        checksum = _sha256_file(path)
+
+        labels_np = self.labels.cpu().numpy().reshape(-1)
+        class_0 = int((labels_np == 0).sum())
+        class_1 = int((labels_np == 1).sum())
+
+        manifest = {
+            "artifact_type": "delay_gnn_dataset",
+            "schema_version": 1,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "dataset": {
+                "samples": int(len(self)),
+                "num_nodes": int(self.num_nodes),
+                "num_node_features": int(self.num_node_features),
+                "links": list(self.links),
+                "window_size": int(self._window_size),
+                "freq_minutes": int(self._freq_minutes),
+                "offset_steps": int(self._offset_steps),
+                "horizon_minutes": int(self.horizon_minutes),
+                "delay_threshold": float(self.delay_threshold),
+                "delay_percentile": float(self.delay_percentile),
+                "topology_weight": float(self.topology_weight),
+                "column_delay": str(self.column_delay),
+            },
+            "distribution": {
+                "class_0": class_0,
+                "class_1": class_1,
+            },
+            "artifact": {
+                "joblib_file": path.name,
+                "joblib_sha256": checksum,
+                "joblib_size_bytes": int(path.stat().st_size),
+            },
+            "input": {
+                "checksums": input_checksums or {},
+            },
+        }
+
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with manifest_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+        sha_path = path.with_suffix(".sha256")
+        with sha_path.open("w", encoding="utf-8") as f:
+            f.write(f"{checksum}  {path.name}\n")
+
+        return manifest_path
 
     def _discover_links(self, links: Optional[Sequence[str]]) -> List[str]:
         if links:
@@ -642,8 +715,8 @@ class DelayGraphDataset(Dataset):
             merged = pd.concat([merged, hops_merged], axis=1)
 
         merged = merged.sort_index()
-        merged = merged.ffill().bfill()
-        merged = merged.interpolate(method="time", limit_direction="both")
+        merged = merged.ffill()
+        merged = merged.interpolate(method="time", limit_direction="forward")
 
         target_data = {}
         for link in self.links:
@@ -854,21 +927,38 @@ def _resample_frame(
 
     if column_delay in agg.columns:
         agg[column_delay] = agg[column_delay].interpolate(
-            method="linear", limit_direction="both"
+            method="linear", limit_direction="forward"
         )
-        agg[column_delay] = agg[column_delay].ffill().bfill()
+        agg[column_delay] = agg[column_delay].ffill()
 
     if "Num_Hops" in agg.columns:
         agg["Num_Hops"] = agg["Num_Hops"].interpolate(
-            method="linear", limit_direction="both"
+            method="linear", limit_direction="forward"
         )
-        agg["Num_Hops"] = agg["Num_Hops"].ffill().bfill()
+        agg["Num_Hops"] = agg["Num_Hops"].ffill()
 
     if delay_threshold is not None and column_delay in agg.columns:
         agg["high_delay"] = (agg[column_delay] > delay_threshold).astype(int)
     agg = agg.dropna(subset=[column_delay], how="all")
     agg = agg.reset_index()
     return agg
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _collect_input_checksums(data_dir: Path, links: Sequence[str]) -> Dict[str, str]:
+    checksums: Dict[str, str] = {}
+    for link in links:
+        csv_path = data_dir / f"dataset_{link}_links_hops.csv"
+        if csv_path.exists():
+            checksums[csv_path.name] = _sha256_file(csv_path)
+    return checksums
 
 
 def parse_args() -> "argparse.Namespace":
@@ -901,6 +991,11 @@ def parse_args() -> "argparse.Namespace":
         type=Path,
         default=Path("results_artifacts/datasets"),
         help="Output directory when generating multiple horizons",
+    )
+    parser.add_argument(
+        "--skip-manifest",
+        action="store_true",
+        help="Skip writing .manifest.json and .sha256 sidecar files",
     )
     return parser.parse_args()
 
@@ -935,6 +1030,11 @@ if __name__ == "__main__":
             output_path = args.output_dir / f"gnn_dataset_w{args.window_size}_h{horizon}min.joblib"
             dataset.save_joblib(output_path)
             print(f"[{horizon}min] Saved to {output_path}")
+
+            if not args.skip_manifest:
+                checksums = _collect_input_checksums(Path(args.data_dir), dataset.links)
+                manifest_path = dataset.write_manifest(output_path, input_checksums=checksums)
+                print(f"[{horizon}min] Manifest: {manifest_path}")
         
         print("\n" + "=" * 60)
         print("All GNN datasets generated successfully!")
@@ -957,3 +1057,8 @@ if __name__ == "__main__":
         print(f"[INFO] Built DelayGraphDataset with {len(dataset)} samples and {dataset.num_nodes} nodes")
         dataset.save_joblib(args.output_joblib)
         print(f"[INFO] Saved pre-built dataset to {args.output_joblib}")
+
+        if not args.skip_manifest:
+            checksums = _collect_input_checksums(Path(args.data_dir), dataset.links)
+            manifest_path = dataset.write_manifest(args.output_joblib, input_checksums=checksums)
+            print(f"[INFO] Manifest written to {manifest_path}")
